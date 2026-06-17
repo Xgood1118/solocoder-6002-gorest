@@ -1,0 +1,19 @@
+# Security Policy
+
+## Supported Versions
+
+| Version  | Supported          | First Release Date | Final Release |
+| -------- | ------------------ | ------------------ | ------------- |
+| `~1.12.0`| :white_check_mark: | 2026-03-15         | -             |
+| `~1.11.0`| :x:                | 2026-02-13         | `1.11.1`      |
+| `~1.10.0`| :x:                | 2025-09-22         | `1.10.6`      |
+| `~1.9.0` | :x:                | 2025-03-22         | `1.9.14`      |
+| `~1.8.0` | :x:                | 2025-03-21         | `1.8.0`       |
+| `~1.7.0` | :x:                | 2025-02-20         | `1.7.0`       |
+| `~1.6.0` | :x:                | 2022-09-03         | `1.6.48`      |
+| `<1.6`   | :x:                | -                  | -             |
+
+## Reporting a Vulnerability
+
+Please open a new [issue](https://github.com/pilinux/gorest/issues/new/choose)
+to report a vulnerability.

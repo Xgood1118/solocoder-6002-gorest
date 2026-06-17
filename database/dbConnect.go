@@ -1,0 +1,424 @@
+// Package database handles connections to different
+// types of databases.
+package database
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/pilinux/gorest/config"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+
+	// Import MySQL database driver
+	// _ "github.com/jinzhu/gorm/dialects/mysql"
+	"gorm.io/driver/mysql"
+
+	// Import PostgreSQL database driver
+	// _ "github.com/jinzhu/gorm/dialects/postgres"
+	"gorm.io/driver/postgres"
+
+	// Import SQLite3 database driver
+	// _ "github.com/jinzhu/gorm/dialects/sqlite"
+	"gorm.io/driver/sqlite"
+
+	// Import Redis Driver
+	"github.com/mediocregopher/radix/v4"
+
+	// Import Mongo driver
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	opts "go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+)
+
+// dbClient holds the gorm DB connection instance.
+var dbClient *gorm.DB
+
+var sqlDB *sql.DB
+var err error
+
+// redisClient holds the Redis client connection instance.
+var redisClient radix.Client
+
+// RedisConnTTL is the context deadline in seconds for Redis connections.
+var RedisConnTTL int
+
+// mongoClient holds the MongoDB client connection instance.
+var mongoClient *mongo.Client
+
+// errConfigNotInitialized is returned when the configuration is not available.
+var errConfigNotInitialized = errors.New("config is not initialized")
+
+// sqlOpen is a package-level indirection for sql.Open to allow
+// error-path testing via export_test.go.
+var sqlOpen = sql.Open
+
+// protect CloseAllDB from concurrent calls
+var closeAllOnce sync.Once
+
+// InitDB initializes the database connection.
+func InitDB() *gorm.DB {
+	var db = dbClient
+	if db == nil {
+		db = &gorm.DB{}
+	}
+
+	cfg := config.GetConfig()
+	if cfg == nil {
+		db.Error = errConfigNotInitialized
+		return db
+	}
+
+	configureDB := cfg.Database.RDBMS
+
+	driver := configureDB.Env.Driver
+	uri := configureDB.Env.URI
+	username := configureDB.Access.User
+	password := configureDB.Access.Pass
+	database := configureDB.Access.DbName
+	host := configureDB.Env.Host
+	port := configureDB.Env.Port
+	sslmode := configureDB.Ssl.Sslmode
+	timeZone := configureDB.Env.TimeZone
+	maxIdleConns := configureDB.Conn.MaxIdleConns
+	maxOpenConns := configureDB.Conn.MaxOpenConns
+	connMaxLifetime := configureDB.Conn.ConnMaxLifetime
+	logLevel := configureDB.Log.LogLevel
+
+	switch driver {
+	case "mysql":
+		dsn := uri
+		if dsn == "" {
+			address := host
+			if port != "" {
+				address += ":" + port
+			}
+			dsn = username + ":" + password + "@tcp(" + address + ")/" + database + "?charset=utf8mb4&parseTime=True&loc=Local"
+			if sslmode == "" {
+				sslmode = "disable"
+			}
+			if sslmode != "disable" {
+				// use host machine's root CAs to verify
+				if sslmode == "require" {
+					dsn += "&tls=true"
+				}
+
+				// perform comprehensive SSL/TLS certificate validation using
+				// certificate signed by a recognized CA or by a self-signed certificate
+				if sslmode == "verify-ca" || sslmode == "verify-full" {
+					dsn += "&tls=custom"
+					err = InitTLSMySQL()
+					if err != nil {
+						db.Error = err
+						return db
+					}
+				}
+			}
+		}
+		sqlDB, err = sqlOpen(driver, dsn)
+		if err != nil {
+			err = fmt.Errorf("failed to open SQL connection: %w", err)
+			db.Error = err
+			return db
+		}
+		sqlDB.SetMaxIdleConns(maxIdleConns)       // max number of connections in the idle connection pool
+		sqlDB.SetMaxOpenConns(maxOpenConns)       // max number of open connections in the database
+		sqlDB.SetConnMaxLifetime(connMaxLifetime) // max amount of time a connection may be reused
+
+		db, err = gorm.Open(mysql.New(mysql.Config{
+			Conn: sqlDB,
+		}), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.LogLevel(logLevel)),
+		})
+		if err != nil {
+			err = fmt.Errorf("failed to open GORM connection: %w", err)
+			db.Error = err
+			return db
+		}
+		// Only for debugging
+		if err == nil {
+			fmt.Println("DB connection successful!")
+		}
+
+	case "postgres":
+		dsn := uri
+		if dsn == "" {
+			address := "host=" + host
+			if port != "" {
+				address += " port=" + port
+			}
+			dsn = address + " user=" + username + " dbname=" + database + " password=" + password + " TimeZone=" + timeZone
+			if sslmode == "" {
+				sslmode = "disable"
+			}
+			if sslmode != "disable" {
+				if configureDB.Ssl.RootCA != "" {
+					dsn += " sslrootcert=" + configureDB.Ssl.RootCA
+				} else if configureDB.Ssl.ServerCert != "" {
+					dsn += " sslrootcert=" + configureDB.Ssl.ServerCert
+				}
+				if configureDB.Ssl.ClientCert != "" {
+					dsn += " sslcert=" + configureDB.Ssl.ClientCert
+				}
+				if configureDB.Ssl.ClientKey != "" {
+					dsn += " sslkey=" + configureDB.Ssl.ClientKey
+				}
+			}
+			dsn += " sslmode=" + sslmode
+		}
+
+		sqlDB, err = sqlOpen("pgx", dsn)
+		if err != nil {
+			err = fmt.Errorf("failed to open SQL connection: %w", err)
+			db.Error = err
+			return db
+		}
+		sqlDB.SetMaxIdleConns(maxIdleConns)       // max number of connections in the idle connection pool
+		sqlDB.SetMaxOpenConns(maxOpenConns)       // max number of open connections in the database
+		sqlDB.SetConnMaxLifetime(connMaxLifetime) // max amount of time a connection may be reused
+
+		db, err = gorm.Open(postgres.New(postgres.Config{
+			Conn: sqlDB,
+		}), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.LogLevel(logLevel)),
+		})
+		if err != nil {
+			err = fmt.Errorf("failed to open GORM connection: %w", err)
+			db.Error = err
+			return db
+		}
+		// Only for debugging
+		if err == nil {
+			fmt.Println("DB connection successful!")
+		}
+
+	case "sqlite3":
+		dsn := database
+		if uri != "" {
+			dsn = uri
+		}
+		db, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{
+			Logger:                                   logger.Default.LogMode(logger.Silent),
+			DisableForeignKeyConstraintWhenMigrating: true,
+		})
+		if err != nil {
+			err = fmt.Errorf("failed to open GORM connection: %w", err)
+			db.Error = err
+			return db
+		}
+		// Only for debugging
+		if err == nil {
+			fmt.Println("DB connection successful!")
+		}
+
+	default:
+		err = fmt.Errorf("the driver %s is not implemented yet", driver)
+		db.Error = err
+		return db
+	}
+
+	dbClient = db
+
+	return dbClient
+}
+
+// GetDB returns the current database connection.
+func GetDB() *gorm.DB {
+	return dbClient
+}
+
+// InitRedis initializes the Redis client connection.
+func InitRedis() (radix.Client, error) {
+	cfg := config.GetConfig()
+	if cfg == nil {
+		return nil, errConfigNotInitialized
+	}
+
+	configureRedis := cfg.Database.REDIS
+
+	RedisConnTTL = configureRedis.Conn.ConnTTL
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(RedisConnTTL)*time.Second)
+	defer cancel()
+
+	redisAddr := configureRedis.Env.URI
+	if redisAddr == "" {
+		redisAddr = fmt.Sprintf("redis://%v:%v",
+			configureRedis.Env.Host,
+			configureRedis.Env.Port)
+	}
+
+	rClient, err := (radix.PoolConfig{
+		Size: configureRedis.Conn.PoolSize,
+	}).New(ctx, "tcp", redisAddr)
+	if err != nil {
+		err = fmt.Errorf("failed to connect to Redis: %w", err)
+		return rClient, err
+	}
+	// Only for debugging
+	fmt.Println("REDIS pool connection successful!")
+
+	redisClient = rClient
+
+	return redisClient, nil
+}
+
+// GetRedis returns the current Redis client connection.
+func GetRedis() radix.Client {
+	return redisClient
+}
+
+// InitMongo initializes the MongoDB client connection.
+func InitMongo() (*mongo.Client, error) {
+	cfg := config.GetConfig()
+	if cfg == nil {
+		return nil, errConfigNotInitialized
+	}
+
+	configureMongo := cfg.Database.MongoDB
+
+	// connect to the database or cluster
+	uri := configureMongo.Env.URI
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(configureMongo.Env.ConnTTL)*time.Second)
+	defer cancel()
+
+	serverAPIOptions := opts.ServerAPI(opts.ServerAPIVersion1)
+
+	clientOptions := opts.Client().
+		ApplyURI(uri).
+		SetAppName(configureMongo.Env.AppName).
+		SetServerAPIOptions(serverAPIOptions).
+		SetMaxPoolSize(configureMongo.Env.PoolSize).
+		SetConnectTimeout(time.Duration(configureMongo.Env.ConnTTL) * time.Second)
+
+	// for monitoring pool
+	if configureMongo.Env.PoolMon == "yes" {
+		poolMonitor := &event.PoolMonitor{
+			Event: func(evt *event.PoolEvent) {
+				switch evt.Type {
+				case event.ConnectionPoolCreated:
+					fmt.Println("ConnectionPoolCreated")
+				case event.ConnectionPoolReady:
+					fmt.Println("ConnectionPoolReady")
+				case event.ConnectionPoolCleared:
+					fmt.Println("ConnectionPoolCleared")
+				case event.ConnectionPoolClosed:
+					fmt.Println("ConnectionPoolClosed")
+				case event.ConnectionCreated:
+					fmt.Println("ConnectionCreated")
+				case event.ConnectionReady:
+					fmt.Println("ConnectionReady")
+				case event.ConnectionClosed:
+					fmt.Println("ConnectionClosed")
+				case event.ConnectionCheckOutStarted:
+					fmt.Println("ConnectionCheckOutStarted")
+				case event.ConnectionCheckOutFailed:
+					fmt.Println("ConnectionCheckOutFailed")
+				case event.ConnectionCheckedOut:
+					fmt.Println("ConnectionCheckedOut")
+				case event.ConnectionCheckedIn:
+					fmt.Println("ConnectionCheckedIn")
+				}
+			},
+		}
+		clientOptions.SetPoolMonitor(poolMonitor)
+	}
+
+	client, err := mongo.Connect(clientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	// validate connectivity to the database or cluster by pinging it
+	if err := client.Ping(ctx, readpref.Primary()); err != nil {
+		_ = client.Disconnect(context.Background())
+		return nil, err
+	}
+
+	// only for debugging
+	fmt.Println("MongoDB pool connection successful!")
+
+	mongoClient = client
+
+	return mongoClient, nil
+}
+
+// GetMongo returns the current MongoDB client connection.
+func GetMongo() *mongo.Client {
+	return mongoClient
+}
+
+// CloseAllDB closes all database connections.
+func CloseAllDB() error {
+	var err error
+	closeAllOnce.Do(func() {
+		err = CloseSQL()
+		if err != nil {
+			return
+		}
+
+		err = CloseRedis()
+		if err != nil {
+			return
+		}
+
+		err = CloseMongo()
+		if err != nil {
+			return
+		}
+	})
+	return err
+}
+
+// CloseSQL closes the SQL database connection.
+func CloseSQL() error {
+	if dbClient != nil {
+		fmt.Println("Closing SQL DB connection...")
+		db, err := dbClient.DB()
+		if err != nil {
+			return err
+		}
+		if err := db.Close(); err != nil {
+			return err
+		}
+		dbClient = nil
+		sqlDB = nil
+		fmt.Println("SQL DB connection closed!")
+	}
+
+	return nil
+}
+
+// CloseRedis closes the Redis database connection.
+func CloseRedis() error {
+	if redisClient != nil {
+		fmt.Println("Closing Redis connection...")
+		if err := radix.Client.Close(redisClient); err != nil {
+			return err
+		}
+		redisClient = nil
+		fmt.Println("Redis connection closed!")
+	}
+
+	return nil
+}
+
+// CloseMongo closes the MongoDB database connection.
+func CloseMongo() error {
+	if mongoClient != nil {
+		fmt.Println("Closing MongoDB connection...")
+		if err := mongoClient.Disconnect(context.Background()); err != nil {
+			return err
+		}
+		mongoClient = nil
+		fmt.Println("MongoDB connection closed!")
+	}
+
+	return nil
+}
