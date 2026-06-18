@@ -14,6 +14,7 @@ type auth model.Auth
 type twoFA model.TwoFA
 type twoFABackup model.TwoFABackup
 type tempEmail model.TempEmail
+type loginAttempt model.LoginAttempt
 
 // DropAllTables drops all database tables. Use with caution.
 func DropAllTables() error {
@@ -23,6 +24,7 @@ func DropAllTables() error {
 		&tempEmail{},
 		&twoFABackup{},
 		&twoFA{},
+		&loginAttempt{},
 		&auth{},
 	); err != nil {
 		return err
@@ -48,6 +50,7 @@ func StartMigration(configure config.Configuration) error {
 			&twoFA{},
 			&twoFABackup{},
 			&tempEmail{},
+			&loginAttempt{},
 		); err != nil {
 			return err
 		}
@@ -61,6 +64,7 @@ func StartMigration(configure config.Configuration) error {
 		&twoFA{},
 		&twoFABackup{},
 		&tempEmail{},
+		&loginAttempt{},
 	); err != nil {
 		return err
 	}

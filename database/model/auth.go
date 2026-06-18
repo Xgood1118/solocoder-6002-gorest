@@ -108,6 +108,8 @@ func (v Auth) MarshalJSON() ([]byte, error) {
 	aux := struct {
 		AuthID      uint64     `json:"authID"`
 		Email       string     `json:"email"`
+		CreatedAt   *time.Time `json:"createdAt,omitempty"`
+		UpdatedAt   *time.Time `json:"updatedAt,omitempty"`
 		LastLoginIP *string    `json:"lastLoginIP,omitempty"`
 		LastLoginUA *string    `json:"lastLoginUA,omitempty"`
 		LastLoginAt *time.Time `json:"lastLoginAt,omitempty"`
@@ -117,6 +119,15 @@ func (v Auth) MarshalJSON() ([]byte, error) {
 		LastLoginIP: v.LastLoginIP,
 		LastLoginUA: v.LastLoginUA,
 		LastLoginAt: v.LastLoginAt,
+	}
+
+	if !v.CreatedAt.IsZero() {
+		t := v.CreatedAt
+		aux.CreatedAt = &t
+	}
+	if !v.UpdatedAt.IsZero() {
+		t := v.UpdatedAt
+		aux.UpdatedAt = &t
 	}
 
 	return json.Marshal(aux)
@@ -151,4 +162,16 @@ type TempEmail struct {
 	EmailNonce  string    `json:"-"`
 	EmailHash   string    `gorm:"index" json:"-"`
 	IDAuth      uint64    `gorm:"index" json:"-"`
+}
+
+// LoginAttempt tracks per-auth failed-login counters and temporary lock state.
+//
+// It is the RDBMS-backed fallback for account lockout when Redis is not
+// available, ensuring multi-process deployments still coordinate attempt
+// counts correctly.
+type LoginAttempt struct {
+	AuthID    uint64     `gorm:"primaryKey;column:auth_id" json:"authID"`
+	Attempts  int        `gorm:"column:attempts;not null;default:0" json:"attempts"`
+	LockUntil *time.Time `gorm:"column:lock_until" json:"lockUntil,omitempty"`
+	UpdatedAt time.Time  `gorm:"column:updated_at" json:"updatedAt,omitzero"`
 }

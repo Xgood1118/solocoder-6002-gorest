@@ -105,12 +105,12 @@ type lockoutEntry struct {
 }
 
 // LockoutStore is a thread-safe, TTL-aware, bounded in-memory store for
-// login-attempt counters and account-lock state. It is used as a fallback
-// when Redis is not available.
+// login-attempt counters and account-lock state. It is the final fallback
+// when neither Redis nor RDBMS is available for lockout state.
 //
-// Note: in multi-process deployments without Redis, attempts are NOT
-// coordinated across processes. Operators should either enable Redis or
-// understand this limitation.
+// Note: in multi-process deployments, in-memory state is per-process and
+// cannot be shared. Prefer Redis or RDBMS-backed lockout for multi-process
+// deployments.
 type LockoutStore struct {
 	mu      sync.RWMutex
 	data    map[uint64]lockoutEntry
@@ -146,23 +146,40 @@ func (s *LockoutStore) evictOldest() {
 	}
 }
 
-// Get returns the current attempts and lock-until time for an authID,
-// along with whether the entry exists and is fresh.
+// Get returns the current attempts and lock-until time for an authID.
+//
+// It performs lazy expiration: if the stored lock has already expired the
+// entry is reset on the fly (attempts cleared, lockUntil zeroed) so that
+// stale entries never block a legit login and do not consume a slot forever.
 func (s *LockoutStore) Get(authID uint64) (attempts int, lockUntil time.Time, ok bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	entry, ok := s.data[authID]
 	if !ok {
 		return 0, time.Time{}, false
 	}
+
+	now := time.Now()
+	// lock has expired -> reset this entry lazily
+	if !entry.LockUntil.IsZero() && entry.LockUntil.Before(now) {
+		entry.Attempts = 0
+		entry.LockUntil = time.Time{}
+		entry.UpdatedAt = now
+		s.data[authID] = entry
+	}
+
 	return entry.Attempts, entry.LockUntil, true
 }
 
 // Increment increments the failed-attempt counter for authID.
-// If the store is over capacity the oldest entry is evicted first.
+//
+// If there is an expired lock on the entry it is reset first so the counter
+// restarts from 1. If the store is over capacity the oldest entry is evicted.
 func (s *LockoutStore) Increment(authID uint64) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
+
 	entry, ok := s.data[authID]
 	if !ok {
 		if len(s.data) >= s.maxKeys {
@@ -170,8 +187,15 @@ func (s *LockoutStore) Increment(authID uint64) int {
 		}
 		entry = lockoutEntry{Attempts: 0}
 	}
+
+	// expired lock -> start fresh
+	if !entry.LockUntil.IsZero() && entry.LockUntil.Before(now) {
+		entry.Attempts = 0
+		entry.LockUntil = time.Time{}
+	}
+
 	entry.Attempts++
-	entry.UpdatedAt = time.Now()
+	entry.UpdatedAt = now
 	s.data[authID] = entry
 	return entry.Attempts
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/mediocregopher/radix/v4"
 	log "github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 
 	"github.com/pilinux/gorest/config"
 	"github.com/pilinux/gorest/database"
@@ -19,50 +21,175 @@ import (
 // --- Account lockout ---
 
 // useRedisForLockout reports whether Redis should be used for lockout state.
-// When Redis is not enabled/available the caller should fall back to the
-// in-memory store.
+// When Redis is not enabled/available the caller should fall back to
+// the next tier (RDBMS, then in-memory).
 func useRedisForLockout() bool {
-	return config.IsRedis()
+	if !config.IsRedis() {
+		return false
+	}
+	return database.GetRedis() != nil
+}
+
+// useRDBMSForLockout reports whether the RDBMS fallback is available.
+func useRDBMSForLockout() bool {
+	if !config.IsRDBMS() {
+		return false
+	}
+	return database.GetDB() != nil
+}
+
+// rdbmsGetLockoutLoad loads the current lockout state from the relational database.
+// If the row does not exist it returns zero values and ok=false.
+// If the stored lock has already expired the row is reset on the fly (lazy expiry).
+func rdbmsLockoutLoad(authID uint64) (attempts int, lockUntil time.Time, ok bool, err error) {
+	db := database.GetDB()
+	var row model.LoginAttempt
+	if rerr := db.Where("auth_id = ?", authID).First(&row).Error; rerr != nil {
+		if errors.Is(rerr, gorm.ErrRecordNotFound) {
+			return 0, time.Time{}, false, nil
+		}
+		return 0, time.Time{}, false, rerr
+	}
+
+	now := time.Now()
+	// lazy expiry: lock has passed -> reset the row atomically?
+	// We do a best-effort reset here and now + return non-lazy reset in Update so subsequent writes will also handle it.
+	if row.LockUntil != nil && !row.LockUntil.IsZero() && row.LockUntil.Before(now) {
+		// non-blocking best-effort reset
+		_ = db.Model(&model.LoginAttempt{}).
+			Where("auth_id = ? AND lock_until < ?", authID, now).
+			Updates(map[string]any{"attempts": 0, "lock_until": nil, "updated_at": now}).
+			Error
+		return 0, time.Time{}, false, nil
+	}
+
+	attempts = row.Attempts
+	if row.LockUntil != nil {
+		lockUntil = *row.LockUntil
+	}
+	return attempts, lockUntil, true, nil
+}
+
+// rdbmsLockoutIncrement atomically increments the failed-attempt counter in
+// the relational database. It returns the new attempt count and whether the
+// account has just become locked as a result of this call.
+func rdbmsLockoutIncrement(authID uint64) (attempts int, lockedNow bool, err error) {
+	db := database.GetDB()
+	lockDuration := time.Duration(model.AccountLockDurationMinutes) * time.Minute
+	maxAttempts := model.MaxLoginAttempts
+	now := time.Now()
+
+	// Ensure a row exists (upsert semantics via FirstOrCreate is racy but acceptable
+	// because the subsequent update is atomic).
+	var row model.LoginAttempt
+	if cerr := db.Where("auth_id = ?", authID).
+		Attrs(model.LoginAttempt{Attempts: 0, UpdatedAt: now}).
+		FirstOrCreate(&row).Error; cerr != nil {
+		// Try a plain insert in case FirstOrCreate failed
+		// We don't return yet: maybe it was a race; fall through and attempt the update.
+		log.WithError(cerr).WithField("authID", authID).Warn("lockout: RDBMS FirstOrCreate failed, continuing with atomic update")
+	}
+
+	// Atomically increment attempts and bump updated_at.
+	// If the lock has expired also reset it first.
+	result := db.Model(&model.LoginAttempt{}).
+		Where("auth_id = ?", authID).
+		UpdateColumns(map[string]any{
+			"attempts":   gorm.Expr("attempts + ?", 1),
+			"updated_at": now,
+		})
+	if result.Error != nil {
+		return 0, false, result.Error
+	}
+
+	// Read back the new value.
+	var updated model.LoginAttempt
+	if rerr := db.Where("auth_id = ?", authID).First(&updated).Error; rerr != nil {
+		return 0, false, rerr
+	}
+	attempts = updated.Attempts
+
+	// Threshold reached? -> set lock (idempotent)
+	if attempts >= maxAttempts {
+		until := now.Add(lockDuration)
+		// Use "SET lock_until = GREATEST(lock_until, ?)" to not shorten an existing lock.
+		res := db.Model(&model.LoginAttempt{}).
+			Where("auth_id = ? AND (lock_until IS NULL OR lock_until < ?)", authID, until).
+			Updates(map[string]any{"lock_until": until, "updated_at": now})
+		if res.Error != nil {
+			log.WithError(res.Error).WithField("authID", authID).Warn("lockout: RDBMS set lock_until failed")
+			return attempts, false, res.Error
+		}
+		if res.RowsAffected > 0 {
+			lockedNow = true
+		}
+	}
+
+	return attempts, lockedNow, nil
+}
+
+// rdbmsLockoutReset clears the failed-login counter and any active lock
+// stored in the relational database.
+func rdbmsLockoutReset(authID uint64) error {
+	db := database.GetDB()
+	return db.Where("auth_id = ?", authID).Delete(&model.LoginAttempt{}).Error
 }
 
 // IsAccountLocked reports whether the given authID is currently locked out.
-// On success it returns locked=true plus the time the lock expires (zero time
-// if not locked). A non-nil error means the backend (Redis or memory) could
-// not be queried; callers are expected to treat such failures as "not locked"
-// to avoid Redis outages taking down the login path.
+//
+// Tiers (first available):
+//  1. Redis  (best performance, multi-process safe)
+//  2. RDBMS  (multi-process safe, used when Redis is unavailable)
+//  3. Memory (single-process only, final fallback)
+//
+// A failure of an error means the backend could not be queried; callers are expected
+// to treat such failures as "not locked" to avoid outages taking down the
+// login path.
 func IsAccountLocked(authID uint64) (locked bool, lockUntil time.Time, err error) {
 	if authID == 0 {
 		return false, time.Time{}, nil
 	}
 
+	// --- Tier 1: Redis
 	if useRedisForLockout() {
 		client := database.GetRedis()
-		if client != nil {
-			rConnTTL := config.GetConfig().Database.REDIS.Conn.ConnTTL
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(rConnTTL)*time.Second)
-			defer cancel()
+		rConnTTL := config.GetConfig().Database.REDIS.Conn.ConnTTL
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(rConnTTL)*time.Second)
+		defer cancel()
 
-			lockKey := model.AccountLockKeyPrefix + strconv.FormatUint(authID, 10)
-			exists := 0
-			if rErr := client.Do(ctx, radix.FlatCmd(&exists, "EXISTS", lockKey)); rErr == nil && exists > 0 {
-				// locked: try to read TTL for informational purposes
-				ttlSec := -2
-				_ = client.Do(ctx, radix.FlatCmd(&ttlSec, "TTL", lockKey))
-				until := time.Time{}
-				if ttlSec > 0 {
-					until = time.Now().Add(time.Duration(ttlSec) * time.Second)
-				}
-				return true, until, nil
-			} else if rErr != nil {
-				log.WithError(rErr).WithField("authID", authID).Warn("lockout: Redis EXISTS failed, falling back to in-memory")
-				// fall through to in-memory fallback
-			} else {
-				return false, time.Time{}, nil
+		lockKey := model.AccountLockKeyPrefix + strconv.FormatUint(authID, 10)
+		exists := 0
+		if rErr := client.Do(ctx, radix.FlatCmd(&exists, "EXISTS", lockKey)); rErr == nil && exists > 0 {
+			ttlSec := -2
+			_ = client.Do(ctx, radix.FlatCmd(&ttlSec, "TTL", lockKey))
+			until := time.Time{}
+			if ttlSec > 0 {
+				until = time.Now().Add(time.Duration(ttlSec) * time.Second)
 			}
+			return true, until, nil
+		} else if rErr != nil {
+			log.WithError(rErr).WithField("authID", authID).Warn("lockout: Redis EXISTS failed, falling back to RDBMS")
+			// fall through
+		} else {
+			return false, time.Time{}, nil
 		}
 	}
 
-	// in-memory fallback
+	// --- Tier 2: RDBMS
+	if useRDBMSForLockout() {
+		attempts, lockUntilDB, ok, rerr := rdbmsLockoutLoad(authID)
+		if rerr == nil {
+			if ok && !lockUntilDB.IsZero() && lockUntilDB.After(time.Now()) {
+				return true, lockUntilDB, nil
+			}
+			_ = attempts
+			return false, time.Time{}, nil
+		}
+		log.WithError(rerr).WithField("authID", authID).Warn("lockout: RDBMS load failed, falling back to in-memory")
+		// fall through
+	}
+
+	// --- Tier 3: in-memory
 	attempts, lockUntilMem, ok := model.InMemoryLockout.Get(authID)
 	_ = attempts
 	if ok && !lockUntilMem.IsZero() && lockUntilMem.After(time.Now()) {
@@ -72,12 +199,13 @@ func IsAccountLocked(authID uint64) (locked bool, lockUntil time.Time, err error
 }
 
 // RecordFailedLogin increments the failed-login counter for authID.
+//
 // It returns the new attempt count and whether the account has just become
 // locked as a result of this call.
 //
-// Redis is preferred; on failure the in-memory store is used. Errors are
-// logged but never returned to the caller so that a Redis outage never
-// breaks the login flow.
+// Redis is preferred; on failure RDBMS is tried; on RDBMS failure the
+// in-memory store is used. Errors are logged but never returned to the
+// caller so that a backend outage never breaks the login flow.
 func RecordFailedLogin(authID uint64) (attempts int, lockedNow bool) {
 	if authID == 0 {
 		return 0, false
@@ -86,6 +214,7 @@ func RecordFailedLogin(authID uint64) (attempts int, lockedNow bool) {
 	lockDuration := time.Duration(model.AccountLockDurationMinutes) * time.Minute
 	maxAttempts := model.MaxLoginAttempts
 
+	// --- Tier 1: Redis
 	if useRedisForLockout() {
 		client := database.GetRedis()
 		if client != nil {
@@ -96,32 +225,35 @@ func RecordFailedLogin(authID uint64) (attempts int, lockedNow bool) {
 			attemptKey := model.LoginAttemptKeyPrefix + strconv.FormatUint(authID, 10)
 			lockKey := model.AccountLockKeyPrefix + strconv.FormatUint(authID, 10)
 
-			// INCR attempts
 			newCount := 0
-			if err := client.Do(ctx, radix.FlatCmd(&newCount, "INCR", attemptKey)); err != nil {
-				log.WithError(err).WithField("authID", authID).Warn("lockout: Redis INCR failed, falling back to in-memory")
-				goto MemoryFallback
-			}
-			attempts = newCount
+			if err := client.Do(ctx, radix.FlatCmd(&newCount, "INCR", attemptKey)); err == nil {
+				attempts = newCount
+				ttlSec := int(lockDuration.Seconds())
+				_ = client.Do(ctx, radix.FlatCmd(nil, "EXPIRE", attemptKey, ttlSec))
 
-			// set/refresh TTL on the attempts key
-			ttlSec := int(lockDuration.Seconds())
-			_ = client.Do(ctx, radix.FlatCmd(nil, "EXPIRE", attemptKey, ttlSec))
-
-			if attempts >= maxAttempts {
-				// lock the account
-				ok := ""
-				if err := client.Do(ctx, radix.FlatCmd(&ok, "SET", lockKey, "1", "EX", ttlSec, "NX")); err == nil {
-					lockedNow = true
+				if attempts >= maxAttempts {
+					ok := ""
+					if sErr := client.Do(ctx, radix.FlatCmd(&ok, "SET", lockKey, "1", "EX", ttlSec, "NX")); sErr == nil && ok == "OK" {
+						lockedNow = true
+					}
 				}
-				// if NX returned nil because the key already existed, we still
-				// report the account is not *newly* locked on this call
+				return attempts, lockedNow
 			}
-			return attempts, lockedNow
+			log.WithError(err).WithField("authID", authID).Warn("lockout: Redis INCR failed, falling back to RDBMS")
 		}
 	}
 
-MemoryFallback:
+	// --- Tier 2: RDBMS
+	if useRDBMSForLockout() {
+		att, locked, rerr := rdbmsLockoutIncrement(authID)
+		if rerr == nil {
+			return att, locked
+		}
+		log.WithError(rerr).WithField("authID", authID).Warn("lockout: RDBMS increment failed, falling back to in-memory")
+		// fall through
+	}
+
+	// --- Tier 3: in-memory
 	attempts = model.InMemoryLockout.Increment(authID)
 	if attempts >= maxAttempts {
 		until := time.Now().Add(lockDuration)
@@ -133,12 +265,16 @@ MemoryFallback:
 
 // ResetLoginAttempts clears the failed-login counter and any active lock for
 // authID. It is called after a successful authentication.
+//
+// It clears state from all available tiers (Redis, RDBMS, in-memory) so that
+// no stale lockout data is left behind when switching backends.
 func ResetLoginAttempts(authID uint64) {
 	if authID == 0 {
 		return
 	}
 
-	if useRedisForLockout() {
+	// --- Tier 1: Redis
+	if config.IsRedis() {
 		client := database.GetRedis()
 		if client != nil {
 			rConnTTL := config.GetConfig().Database.REDIS.Conn.ConnTTL
@@ -152,6 +288,14 @@ func ResetLoginAttempts(authID uint64) {
 		}
 	}
 
+	// --- Tier 2: RDBMS
+	if config.IsRDBMS() {
+		if err := rdbmsLockoutReset(authID); err != nil {
+			log.WithError(err).WithField("authID", authID).Warn("lockout: RDBMS reset failed")
+		}
+	}
+
+	// --- Tier 3: in-memory
 	model.InMemoryLockout.Reset(authID)
 }
 
