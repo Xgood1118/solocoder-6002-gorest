@@ -3,8 +3,10 @@ package handler
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/pilinux/argon2"
 	log "github.com/sirupsen/logrus"
@@ -20,10 +22,14 @@ import (
 
 // Login authenticates a user and returns a new access/refresh token pair.
 //
+// clientIP and userAgent are recorded as last-login metadata on every attempt
+// (both success and failure) so that stale timestamps never mask account
+// activity.
+//
 // If email verification is enabled, it requires the account email to be verified.
 // If 2FA is enabled and configured for the user, it prepares in-memory state for
 // the OTP validation step.
-func Login(payload model.AuthPayload) (httpResponse model.HTTPResponse, httpStatusCode int) {
+func Login(payload model.AuthPayload, clientIP, userAgent string) (httpResponse model.HTTPResponse, httpStatusCode int) {
 	payload.Email = strings.TrimSpace(payload.Email)
 	if !lib.ValidateEmail(payload.Email) {
 		httpResponse.Message = "wrong email address"
@@ -46,12 +52,37 @@ func Login(payload model.AuthPayload) (httpResponse model.HTTPResponse, httpStat
 		return
 	}
 
+	// account lockout check (by Auth primary key)
+	if locked, until, _ := service.IsAccountLocked(v.AuthID); locked {
+		remaining := time.Until(until)
+		if remaining < 0 {
+			remaining = 0
+		}
+		minutes := int(remaining.Minutes())
+		if minutes <= 0 {
+			minutes = 1
+		}
+		httpResponse.Message = fmt.Sprintf("account temporarily locked, try again in %d minute(s)", minutes)
+		httpStatusCode = http.StatusUnauthorized
+		return
+	}
+
+	// always bump last-login timestamp, even on password errors, so the
+	// "last activity" field is never stuck at registration time.
+	if upErr := service.UpdateLastLogin(v.AuthID, clientIP, userAgent); upErr != nil {
+		log.WithError(upErr).WithField("authID", v.AuthID).Warn("login: failed to update last-login metadata")
+	}
+
 	// app settings
 	configSecurity := config.GetConfig().Security
 
 	// check whether email verification is required
 	if configSecurity.VerifyEmail {
 		if v.VerifyEmail != model.EmailVerified {
+			// password failure semantics: record failed attempt even when the
+			// real reason is an unverified email, matching the original 401
+			// response behaviour
+			service.RecordFailedLogin(v.AuthID)
 			httpResponse.Message = "email verification required"
 			httpStatusCode = http.StatusUnauthorized
 			return
@@ -66,10 +97,14 @@ func Login(payload model.AuthPayload) (httpResponse model.HTTPResponse, httpStat
 		return
 	}
 	if !verifyPass {
+		service.RecordFailedLogin(v.AuthID)
 		httpResponse.Message = "wrong credentials"
 		httpStatusCode = http.StatusUnauthorized
 		return
 	}
+
+	// successful login: clear any prior failed attempts
+	service.ResetLoginAttempts(v.AuthID)
 
 	// custom claims
 	claims := middleware.MyCustomClaims{}
@@ -168,7 +203,16 @@ func Login(payload model.AuthPayload) (httpResponse model.HTTPResponse, httpStat
 }
 
 // Refresh issues a new access/refresh token pair for an authenticated session.
-func Refresh(claims middleware.MyCustomClaims) (httpResponse model.HTTPResponse, httpStatusCode int) {
+//
+// The old refresh token (identified by jtiRefresh) is immediately invalidated
+// via the JWT blacklist. If Redis is not available rotation is skipped and
+// rotationResult.Degraded is set to true so the caller can surface a warning
+// header to the client.
+func Refresh(
+	claims middleware.MyCustomClaims,
+	jtiRefresh string,
+	expRefresh int64,
+) (httpResponse model.HTTPResponse, httpStatusCode int, rotationResult service.RotationResult) {
 	// check validity
 	ok := service.ValidateAuthID(claims.AuthID)
 	if !ok {
@@ -176,6 +220,11 @@ func Refresh(claims middleware.MyCustomClaims) (httpResponse model.HTTPResponse,
 		httpStatusCode = http.StatusUnauthorized
 		return
 	}
+
+	// attempt to rotate: invalidate the *previous* refresh token.
+	// This never fails the request; at worst rotationResult.Degraded=true
+	// is surfaced to the caller as a warning header.
+	rotationResult = service.RotateRefreshToken(jtiRefresh, expRefresh)
 
 	// issue new tokens
 	accessJWT, _, err := middleware.GetJWT(claims, "access")

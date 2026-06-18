@@ -94,3 +94,129 @@ func (s *Secret2FAStore) Delete(key uint64) {
 // InMemorySecret2FA keeps secrets temporarily
 // in memory to set up 2FA.
 var InMemorySecret2FA = NewSecret2FAStore()
+
+// --- Login attempt / account lockout in-memory store ---
+
+// lockoutEntry holds a failed-attempt count and optional lock-until timestamp.
+type lockoutEntry struct {
+	Attempts int
+	LockUntil time.Time
+	UpdatedAt time.Time
+}
+
+// LockoutStore is a thread-safe, TTL-aware, bounded in-memory store for
+// login-attempt counters and account-lock state. It is used as a fallback
+// when Redis is not available.
+//
+// Note: in multi-process deployments without Redis, attempts are NOT
+// coordinated across processes. Operators should either enable Redis or
+// understand this limitation.
+type LockoutStore struct {
+	mu      sync.RWMutex
+	data    map[uint64]lockoutEntry
+	maxKeys int
+}
+
+// NewLockoutStore creates a LockoutStore with the given capacity.
+// When maxKeys <= 0 a reasonable default is used.
+func NewLockoutStore(maxKeys int) *LockoutStore {
+	if maxKeys <= 0 {
+		maxKeys = 10000
+	}
+	return &LockoutStore{
+		data:    make(map[uint64]lockoutEntry),
+		maxKeys: maxKeys,
+	}
+}
+
+// evictOldest removes the oldest entry when the store is over capacity.
+func (s *LockoutStore) evictOldest() {
+	var oldestAuthID uint64
+	var oldestUpdated time.Time
+	first := true
+	for authID, entry := range s.data {
+		if first || entry.UpdatedAt.Before(oldestUpdated) {
+			first = false
+			oldestAuthID = authID
+			oldestUpdated = entry.UpdatedAt
+		}
+	}
+	if !first {
+		delete(s.data, oldestAuthID)
+	}
+}
+
+// Get returns the current attempts and lock-until time for an authID,
+// along with whether the entry exists and is fresh.
+func (s *LockoutStore) Get(authID uint64) (attempts int, lockUntil time.Time, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, ok := s.data[authID]
+	if !ok {
+		return 0, time.Time{}, false
+	}
+	return entry.Attempts, entry.LockUntil, true
+}
+
+// Increment increments the failed-attempt counter for authID.
+// If the store is over capacity the oldest entry is evicted first.
+func (s *LockoutStore) Increment(authID uint64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.data[authID]
+	if !ok {
+		if len(s.data) >= s.maxKeys {
+			s.evictOldest()
+		}
+		entry = lockoutEntry{Attempts: 0}
+	}
+	entry.Attempts++
+	entry.UpdatedAt = time.Now()
+	s.data[authID] = entry
+	return entry.Attempts
+}
+
+// SetLock marks the account as locked until the given time.
+func (s *LockoutStore) SetLock(authID uint64, until time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.data[authID]
+	if !ok {
+		if len(s.data) >= s.maxKeys {
+			s.evictOldest()
+		}
+	}
+	entry.LockUntil = until
+	entry.UpdatedAt = time.Now()
+	s.data[authID] = entry
+}
+
+// Reset resets attempts and lock state for the given authID.
+func (s *LockoutStore) Reset(authID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data, authID)
+}
+
+// CleanupExpired removes entries whose lock-until time has passed and whose
+// last update is older than the given TTL. This can be called periodically
+// from a background goroutine; it is not required for correctness.
+func (s *LockoutStore) CleanupExpired(ttl time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-ttl)
+	for authID, entry := range s.data {
+		if !entry.LockUntil.IsZero() && entry.LockUntil.Before(now) {
+			entry.LockUntil = time.Time{}
+			entry.Attempts = 0
+		}
+		if entry.UpdatedAt.Before(cutoff) && entry.LockUntil.IsZero() {
+			delete(s.data, authID)
+		}
+	}
+}
+
+// InMemoryLockout is the process-wide fallback lockout store used when
+// Redis is unavailable.
+var InMemoryLockout = NewLockoutStore(0)

@@ -5,6 +5,7 @@ package service
 import (
 	"encoding/hex"
 	"strings"
+	"time"
 
 	"github.com/pilinux/crypt"
 	"golang.org/x/crypto/blake2b"
@@ -115,4 +116,32 @@ func DecryptEmail(emailNonce, emailCipher string) (email string, err error) {
 		cipherEmail,
 	)
 	return
+}
+
+// UpdateLastLogin updates the last-login metadata (IP, UA, timestamp) for
+// the given authID. It is called on every login attempt (both success and
+// failure) so that stale timestamps do not mask account activity.
+func UpdateLastLogin(authID uint64, clientIP, userAgent string) error {
+	if authID == 0 {
+		return nil
+	}
+	db := database.GetDB()
+
+	ip := strings.TrimSpace(clientIP)
+	ua := strings.TrimSpace(userAgent)
+	now := time.Now()
+
+	updates := map[string]any{
+		"last_login_ip": nil,
+		"last_login_ua": nil,
+		"last_login_at": now,
+	}
+	if ip != "" {
+		updates["last_login_ip"] = ip
+	}
+	if ua != "" {
+		updates["last_login_ua"] = ua
+	}
+
+	return db.Model(&model.Auth{}).Where("auth_id = ?", authID).Updates(updates).Error
 }

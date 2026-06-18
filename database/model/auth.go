@@ -33,7 +33,18 @@ const (
 	EmailVerificationKeyPrefix string = "gorest-email-verification-"
 	EmailUpdateKeyPrefix       string = "gorest-email-update-"
 	PasswordRecoveryKeyPrefix  string = "gorest-pass-recover-" // #nosec G101 —- Redis key prefix only; contains no secret credentials
+
+	LoginAttemptKeyPrefix  string = "gorest-login-attempt-"
+	AccountLockKeyPrefix   string = "gorest-account-lock-"
 )
+
+// MaxLoginAttempts is the maximum number of consecutive failed login attempts
+// before the account is temporarily locked.
+const MaxLoginAttempts = 5
+
+// AccountLockDurationMinutes is the duration (in minutes) an account remains
+// locked after exceeding the maximum failed login attempts.
+const AccountLockDurationMinutes = 15
 
 // Auth represents the auths table.
 type Auth struct {
@@ -47,6 +58,10 @@ type Auth struct {
 	EmailHash   string         `gorm:"index" json:"-"`
 	Password    string         `json:"password"` // #nosec G117 -- used for input only, custom MarshalJSON excludes it from output
 	VerifyEmail int8           `json:"-"`
+
+	LastLoginIP *string    `gorm:"column:last_login_ip" json:"lastLoginIP,omitempty"`
+	LastLoginUA *string    `gorm:"column:last_login_ua" json:"lastLoginUA,omitempty"`
+	LastLoginAt *time.Time `gorm:"column:last_login_at" json:"lastLoginAt,omitempty"`
 }
 
 // UnmarshalJSON implements the json.Unmarshaler interface for Auth.
@@ -91,11 +106,17 @@ func (v *Auth) UnmarshalJSON(b []byte) error {
 // MarshalJSON implements the json.Marshaler interface for Auth.
 func (v Auth) MarshalJSON() ([]byte, error) {
 	aux := struct {
-		AuthID uint64 `json:"authID"`
-		Email  string `json:"email"`
+		AuthID      uint64     `json:"authID"`
+		Email       string     `json:"email"`
+		LastLoginIP *string    `json:"lastLoginIP,omitempty"`
+		LastLoginUA *string    `json:"lastLoginUA,omitempty"`
+		LastLoginAt *time.Time `json:"lastLoginAt,omitempty"`
 	}{
-		AuthID: v.AuthID,
-		Email:  strings.TrimSpace(v.Email),
+		AuthID:      v.AuthID,
+		Email:       strings.TrimSpace(v.Email),
+		LastLoginIP: v.LastLoginIP,
+		LastLoginUA: v.LastLoginUA,
+		LastLoginAt: v.LastLoginAt,
 	}
 
 	return json.Marshal(aux)

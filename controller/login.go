@@ -43,7 +43,10 @@ func Login(c *gin.Context) {
 		return
 	}
 
-	resp, statusCode := handler.Login(payload)
+	clientIP := c.ClientIP()
+	userAgent := c.GetHeader("User-Agent")
+
+	resp, statusCode := handler.Login(payload, clientIP, userAgent)
 
 	// auth verification failed
 	if statusCode != http.StatusOK {
@@ -102,6 +105,11 @@ func Login(c *gin.Context) {
 	renderer.Render(c, resp.Message, statusCode)
 }
 
+// XGorestWarnHeader is the name of the plaintext warning header returned
+// when a security feature (e.g. refresh-token rotation) has been degraded
+// because a dependency (e.g. Redis) is unavailable.
+const XGorestWarnHeader = "X-Gorest-Warning"
+
 // Refresh issues new JWTs after validation.
 //
 // dependency: JWT
@@ -115,7 +123,21 @@ func Refresh(c *gin.Context) {
 	// get claims
 	claims := service.GetClaims(c)
 
-	resp, statusCode := handler.Refresh(claims)
+	jtiRefresh := c.GetString("jtiRefresh")
+	expRefresh, _ := c.Get("expRefresh")
+	var expRefreshInt int64
+	if v, ok := expRefresh.(int64); ok {
+		expRefreshInt = v
+	}
+
+	resp, statusCode, rotationResult := handler.Refresh(claims, jtiRefresh, expRefreshInt)
+
+	// surface rotation degradation as a plaintext warning header so
+	// operators/monitoring can tell rotation is not being enforced
+	if rotationResult.Degraded {
+		msg := "refresh-token rotation degraded: " + rotationResult.DegradedReason
+		c.Header(XGorestWarnHeader, msg)
+	}
 
 	configSecurity := config.GetConfig().Security
 
