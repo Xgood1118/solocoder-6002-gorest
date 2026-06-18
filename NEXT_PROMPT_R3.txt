@@ -1,0 +1,1 @@
+go build 挂了一个隐藏的编译问题——service/security.go 的 RecordFailedLogin 里,log.WithError(err) 引了个 if err := client.Do(...) 块内的 err,这块外拿不到,编译直接报 undefined: err,整个项目都跑不起来。另外 LockoutStore 上的 CleanupExpired 方法看着还在,全工程没有一处调用它。检查修复一下。
